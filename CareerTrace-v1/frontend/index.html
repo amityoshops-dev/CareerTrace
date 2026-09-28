@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CareerTrace v1</title>
+<style>
+body{font-family:Arial,sans-serif;max-width:1200px;margin:30px auto;padding:0 18px}
+textarea,input{width:100%;box-sizing:border-box;margin:6px 0 14px;padding:10px}
+button{padding:10px 16px;cursor:pointer}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.card{border:1px solid #ddd;border-radius:8px;padding:16px;margin:12px 0}
+pre{white-space:pre-wrap}@media(max-width:800px){.grid{grid-template-columns:1fr}}
+</style></head>
+<body>
+<h1>CareerTrace v1</h1>
+<p>Truthful JD matching, ATS-safe keyword alignment and application tracking.</p>
+<div class="grid">
+<section class="card"><h2>Analyze Job</h2>
+<input id="company" placeholder="Company"><input id="role" placeholder="Role">
+<input id="source" placeholder="Source"><input id="recruiter" placeholder="Recruiter (optional)">
+<input id="email" placeholder="Recruiter email (optional)">
+<textarea id="jd" rows="18" placeholder="Paste complete job description"></textarea>
+<button onclick="analyze()">Analyze & Save</button><pre id="result"></pre></section>
+<section class="card"><h2>Applications</h2><button onclick="loadApps()">Refresh</button><div id="apps"></div></section>
+</div>
+<script>
+async function analyze(){
+ const payload={company:company.value,role:role.value,source:source.value,recruiter:recruiter.value,recruiter_email:email.value,jd:jd.value};
+ result.textContent="Analyzing...";
+ const r=await fetch('/api/applications/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+ const d=await r.json(); result.textContent=JSON.stringify(d,null,2); loadApps();
+}
+async function loadApps(){
+ const r=await fetch('/api/applications'); const d=await r.json();
+ apps.innerHTML=d.map(x=>`<div class="card"><b>${x.company}</b> — ${x.role}<br>Status: ${x.status}<br><small>Supported: ${x.ats_keywords||"None"}<br>Missing: ${x.missing_keywords||"None"}</small></div>`).join('');
+}
+loadApps();
+</script></body></html>

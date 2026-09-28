@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+langgraph==0.2.61
+langchain==0.3.14
+langchain-google-genai==2.0.8
+langsmith==0.2.11
+pydantic==2.10.5
+python-multipart==0.0.20
+python-docx==1.1.2
+pypdf==5.1.0
+python-dotenv==1.0.1
+httpx==0.28.1
