@@ -1,1 +1,1 @@
-# CareerTrace
+chmod +x bootstrap.sh
