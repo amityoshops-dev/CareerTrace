@@ -11,7 +11,7 @@ $PY -m pip install -q openpyxl python-docx 2>/dev/null || $PY -m pip install -q 
 cat > careertrace_pro.py <<'PYEOF'
 """CareerTrace Pro: multi-portal search, resume builder, Excel tracker, signed emails, LinkedIn drafts.
 Loaded by careertrace_ui.py via careertrace_pro.install(app, globals()). A failure here never stops the app."""
-import os, re, io, csv, json, base64, uuid, ssl, smtplib, urllib.request, urllib.parse, datetime as dt
+import os, re, io, csv, json, base64, uuid, ssl, smtplib, urllib.request, urllib.parse, urllib.error, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 from pathlib import Path
@@ -27,6 +27,7 @@ load_dotenv(".env.pro")
 HERE = Path(__file__).parent
 STATIC = HERE / "pro_static"
 G = {}
+STATE = {"conns": [], "msgs": {}}
 AG = None
 RESUME_OUT = "output/Amit_Mankar_Resume_Updated.docx"
 TRACKER = "exports/CareerTrace_Tracker.xlsx"
@@ -35,6 +36,7 @@ DEFAULT_PROFILE = {
     "name": "Amit Mankar", "email": "avmankar001@gmail.com", "phone": "9922080307",
     "linkedin": "https://www.linkedin.com/in/amit-mankar5",
     "blog": "https://substack.com/@intentcuriositysphere",
+    "alumni_terms": "Kotak, Aditya Birla, University of Mumbai, Amravati",
     "projects": [
         {"name": "TBG CORE // Institutional Transaction Banking Platform", "url": "https://tbg-engine.onrender.com/", "summary": ""},
         {"name": "NPCI Multi-Rail Gateway Cockpit & Architecture Blueprint", "url": "https://npci-b2b-engine.onrender.com/", "summary": ""},
@@ -51,7 +53,9 @@ def profile():
     os.makedirs("data", exist_ok=True)
     if not os.path.exists("data/profile.json"):
         json.dump(DEFAULT_PROFILE, open("data/profile.json", "w"), indent=1)
-    return json.load(open("data/profile.json"))
+    P = json.load(open("data/profile.json"))
+    P.setdefault("alumni_terms", DEFAULT_PROFILE["alumni_terms"])
+    return P
 
 
 def norm(s):
@@ -193,6 +197,28 @@ SAMPLES = [
 ]
 
 
+DEAD = ("no longer accepting applications", "no longer available", "job has expired", "this job has expired", "job expired",
+        "position has been filled", "position is no longer", "job is closed", "job has been closed", "posting has expired",
+        "no longer open", "job not found", "page not found", "vacancy has been closed", "this job is no longer",
+        "listing has expired", "job is no longer", "vacancy is closed", "expired job")
+
+
+def check_live(url):
+    """live = page loads with no closed notice; closed = 404/410 or 'no longer available' text; unknown = blocked/unreachable."""
+    if not url or "example.com" in url:
+        return "unknown"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+                                                   "Accept-Language": "en"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            html = r.read(200000).decode("utf-8", "ignore").lower()
+        return "closed" if any(x in html for x in DEAD) else "live"
+    except urllib.error.HTTPError as e:
+        return "closed" if e.code in (404, 410) else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def loc_ok(jloc, locs):
     ln = [norm(l) for l in locs]
     if not ln or any(l in ("india", "all india", "anywhere", "remote") for l in ln):
@@ -217,9 +243,10 @@ def score_job(j, cfg, dropped):
     if cfg["strict_location"] and not loc_ok(j.get("location", ""), locs):
         dropped["location"] += 1
         return None
-    if cfg["days"] and j.get("posted"):
+    days = cfg["days"] or (60 if cfg.get("only_live", True) else 0)
+    if days and j.get("posted"):
         try:
-            if (dt.date.today() - dt.date.fromisoformat(j["posted"])).days > cfg["days"]:
+            if (dt.date.today() - dt.date.fromisoformat(j["posted"])).days > days:
                 dropped["too_old"] += 1
                 return None
         except ValueError:
@@ -309,7 +336,7 @@ def run_search(cfg):
             for nm, r, err in ex.map(run, calls):
                 status[nm] = {"ok": not err, "count": len(r), "error": err}
                 raw += r
-    dropped = {k: 0 for k in ("excluded", "location", "too_old", "missing_must_have", "no_keyword_match", "low_score")}
+    dropped = {k: 0 for k in ("excluded", "location", "too_old", "closed", "missing_must_have", "no_keyword_match", "low_score")}
     best = {}
     for j in raw:
         sj = score_job(j, cfg, dropped)
@@ -318,7 +345,18 @@ def run_search(cfg):
         key = norm(sj["title"]) + "|" + norm(sj["company"])
         if key not in best or len(sj.get("description", "")) > len(best[key].get("description", "")):
             best[key] = sj
-    jobs = sorted(best.values(), key=lambda x: -x["score"])[: cfg["max_jobs"]]
+    only_live = cfg.get("only_live", True)
+    jobs = sorted(best.values(), key=lambda x: -x["score"])[: cfg["max_jobs"] * (2 if only_live else 1)]
+    for j in jobs:
+        j["live"] = "unknown"
+    if only_live and not cfg["dry_run"]:
+        with ThreadPoolExecutor(8) as ex:
+            for j, st in zip(jobs, ex.map(lambda j: check_live(j.get("url", "")), jobs)):
+                j["live"] = st
+        n0 = len(jobs)
+        jobs = [j for j in jobs if j["live"] != "closed"]
+        dropped["closed"] += n0 - len(jobs)
+    jobs = jobs[: cfg["max_jobs"]]
     rpath = cfg.get("resume_path") or (RESUME_OUT if os.path.exists(RESUME_OUT) else G["find_resume"]())
     rt = resume_text(rpath)
     with ThreadPoolExecutor(4) as ex:
@@ -330,8 +368,17 @@ def run_search(cfg):
         else:
             keep.append(j)
     keep.sort(key=lambda x: -x["score"])
+    terms = split(profile().get("alumni_terms", ""))
     for j in keep:
         j["description"] = (j.get("description") or "")[:500]
+        ms = find_matches(STATE["conns"], j.get("company", ""), j.get("title", ""), terms)
+        j["referrals"] = [{"person": f"{p['first']} {p['last']}".strip(), "position": p["position"], "company": p["company"],
+                           "profile": p["url"], "why": p["why"]} for p in ms]
+        cq = urllib.parse.quote_plus(j.get("company", ""))
+        rq = urllib.parse.quote_plus(j.get("company", "") + " recruiter")
+        net = "&network=%5B%22F%22%2C%22S%22%5D&origin=FACETED_SEARCH"
+        j["li_links"] = {"My connections + 2nd-degree at company": f"https://www.linkedin.com/search/results/people/?keywords={cq}{net}",
+                         "Recruiters at company": f"https://www.linkedin.com/search/results/people/?keywords={rq}{net}"}
     note = "" if any(s["ok"] for s in status.values()) or cfg["dry_run"] else \
         "No job source responded. Check keys, or use the portal links below."
     return {"jobs": keep, "providers": status, "dropped": dropped, "raw_count": len(raw), "note": note,
@@ -475,19 +522,22 @@ def _fmt(d):
 HR = ("recruit", "talent", "hiring", "human resources", " hr", "hr ", "acquisition", "people")
 
 
-def find_matches(conns, company, title=""):
+def find_matches(conns, company, title="", terms=None):
     c = norm(company)
     kw = [w for w in norm(title).split() if len(w) > 3]
-    a, b, d = [], [], []
+    terms = [norm(t) for t in (terms or []) if norm(t)]
+    a, al, b, d = [], [], [], []
     for p in conns:
         pc, pos = norm(p["company"]), norm(p["position"])
         if c and pc and (c in pc or pc in c):
-            a.append(p)
+            a.append(dict(p, why="Works at " + company))
+        elif any(t in pc or t in pos for t in terms):
+            al.append(dict(p, why="Alumni / ex-colleague network"))
         elif any(t in " " + pos + " " for t in HR):
-            b.append(p)
+            b.append(dict(p, why="Recruiter / HR"))
         elif kw and sum(w in pos for w in kw) >= 2:
-            d.append(p)
-    return a[:5] + b[:3] + d[:2]
+            d.append(dict(p, why="Similar role"))
+    return a[:5] + al[:3] + b[:3] + d[:2]
 
 
 def li_draft(p, job, hist, prior):
@@ -619,6 +669,7 @@ class SearchReq(BaseModel):
     max_jobs: int = 25
     max_queries: int = 10
     dry_run: bool = False
+    only_live: bool = True
     resume_path: str = ""
 
 
@@ -691,7 +742,9 @@ def install(app, g):
     G.update(g)
     profile()
     r = APIRouter()
-    state = {"conns": _load("data/connections.json", []), "msgs": _load("data/messages.json", {})}
+    state = STATE
+    state["conns"] = _load("data/connections.json", [])
+    state["msgs"] = _load("data/messages.json", {})
 
     @r.get("/pro", response_class=HTMLResponse)
     def page():
@@ -786,13 +839,13 @@ def install(app, g):
 
     @r.post("/api/pro/outreach")
     def outreach(d: DraftReq):
-        ms = find_matches(state["conns"], d.job.company, d.job.title)
+        ms = find_matches(state["conns"], d.job.company, d.job.title, split(profile().get("alumni_terms", "")))
         jd = d.job.model_dump()
 
         def one(p):
             prior = _fmt(state["msgs"].get((p.get("url") or "").lower().rstrip("/"), ""))
             return {"person": f"{p['first']} {p['last']}".strip(), "position": p["position"], "company": p["company"],
-                    "profile": p["url"], "prior": prior, "message": li_draft(p, jd, d.history, prior)}
+                    "profile": p["url"], "prior": prior, "why": p.get("why", ""), "message": li_draft(p, jd, d.history, prior)}
 
         with ThreadPoolExecutor(4) as ex:
             res = list(ex.map(one, ms))
@@ -933,7 +986,7 @@ th{color:var(--mu);font-weight:500}
 <label>Posted within</label><select id="dy"><option value="0">Any time</option><option value="1">24 hours</option><option value="3">3 days</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option></select></div>
 <div><label>Minimum match score (0-100)</label><input id="ms" type="number" value="20">
 <label>Max jobs</label><input id="m" type="number" value="25"></div>
-<div><label>Mode</label><label style="color:var(--tx)"><input type="checkbox" id="d"> Dry run (sample jobs)</label></div>
+<div><label>Mode</label><label style="color:var(--tx)"><input type="checkbox" id="ol" checked> Only open jobs (checks each posting; hides closed/expired)</label><label style="color:var(--tx)"><input type="checkbox" id="d"> Dry run (sample jobs)</label></div>
 </div>
 <p><button class="b" id="sb" onclick="search()">Search all portals</button> <span id="note" class="mu"></span></p>
 <div id="prov"></div></div>
@@ -957,7 +1010,7 @@ th{color:var(--mu);font-weight:500}
 <p><button class="b" onclick="rup()">Upload resume (.docx)</button> <button class="b" onclick="rbuild()">Build updated resume</button> <a id="rdl" href="/api/pro/resume/download" class="hide">Download updated resume</a></p>
 <pre id="rout" class="mu"></pre></div>
 <div class="card"><h3>Profile used in the resume and every email</h3>
-<div class="g"><div><label>Name</label><input id="pn"></div><div><label>Email</label><input id="pe"></div><div><label>Phone</label><input id="pp"></div><div><label>LinkedIn</label><input id="pl"></div><div><label>Blog</label><input id="pb"></div></div>
+<div class="g"><div><label>Name</label><input id="pn"></div><div><label>Email</label><input id="pe"></div><div><label>Phone</label><input id="pp"></div><div><label>LinkedIn</label><input id="pl"></div><div><label>Blog</label><input id="pb"></div><div><label>Alumni / ex-colleague tags (employers, colleges; comma separated)</label><input id="pa"></div></div>
 <h4>Projects (added to the resume and to every email)</h4><div id="prj"></div>
 <p><button class="s" onclick="addp()">+ Add project</button> <button class="b" onclick="savep()">Save profile</button></p></div></section>
 
@@ -974,7 +1027,7 @@ th{color:var(--mu);font-weight:500}
 <script>
 const $=i=>document.getElementById(i),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const S=[["dash","Dashboard"],["find","Find Jobs"],["trk","Applications"],["net","Network"],["res","Resume & Profile"],["draft","Drafts"]];
-let JOBS=[],cur=null,PR=[],OM=[],ST=[];
+let JOBS=[],cur=null,PR=[],OM=[],ST=[],CONN=0,RM=[];
 if(window.self===window.top)$("cl").classList.add("hide");
 function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";clearTimeout(window._t);window._t=setTimeout(()=>t.style.display="none",4500)}
 async function api(u,b,m){
@@ -995,16 +1048,31 @@ async function st(id,s){await api("status",{id,status:s});load()}
 async function search(){
   const b=$("sb");b.disabled=true;$("note").textContent="Searching all configured sources... (can take up to a minute)";
   try{
-    const r=await api("search",{titles:$("t").value,location:$("l").value,keywords:$("k").value,must:$("mu").value,exclude:$("ex").value,days:+$("dy").value,min_score:+$("ms").value,max_jobs:+$("m").value,strict_location:$("sl").checked,dry_run:$("d").checked});
-    JOBS=r.jobs;
-    $("note").textContent=r.note||`${JOBS.length} matching jobs from ${r.raw_count} fetched`+(r.resume_read?"":" (resume not read - skill gaps unavailable)");
+    const r=await api("search",{titles:$("t").value,location:$("l").value,keywords:$("k").value,must:$("mu").value,exclude:$("ex").value,days:+$("dy").value,min_score:+$("ms").value,max_jobs:+$("m").value,strict_location:$("sl").checked,dry_run:$("d").checked,only_live:$("ol").checked});
+    JOBS=r.jobs;try{CONN=(await api("health")).connections}catch(e){}
+    $("note").textContent=r.note||`${JOBS.length} matching jobs from ${r.raw_count} fetched`+(r.resume_read?"":" (resume not read - skill gaps unavailable)")+(CONN?` | ${CONN} LinkedIn connections checked for referrals`:" | no LinkedIn connections loaded: upload Connections.csv in the Network tab");
     $("prov").innerHTML=Object.entries(r.providers).map(([k,v])=>`<span class="tag ${v.ok?"ok":"w"}" title="${esc(v.error)}">${esc(k)}: ${v.ok?v.count+" jobs":esc(v.error)}</span>`).join("");
-    $("jobs").innerHTML=JOBS.map((x,i)=>`<tr><td><b>${esc(x.title)}</b><br><span class="mu">${esc(x.company)} | ${esc(x.location)} ${x.posted?"| "+esc(x.posted):""}</span>${x.partial?'<br><span class="tag w">snippet only - verify description</span>':""}</td><td><span class="tag">${esc(x.portal)}</span></td><td><span class="sc" style="color:${x.score>=70?"var(--ok)":x.score>=50?"var(--warn)":"var(--mu)"}">${x.score}</span>${x.resume_pct!=null?`<br><span class="mu">resume fit ${x.resume_pct}%</span>`:""}</td><td>${x.matched.map(k=>`<span class="tag ok">${esc(k)}</span>`).join("")}${(x.supported||[]).map(k=>`<span class="tag ok">${esc(k)}</span>`).join("")}${(x.gaps||[]).map(k=>`<span class="tag w" title="Required by the job but not in your resume">gap: ${esc(k)}</span>`).join("")}</td><td>${x.url?`<a href="${esc(x.url)}" target="_blank"><button class="s">Open / Apply</button></a>`:""}<button class="s" onclick="sv(${i},'Saved')">Save</button><button class="s" onclick="sv(${i},'Applied')">Mark applied</button><button class="s" onclick="dr(${i})">Drafts</button></td></tr>`).join("")||'<tr><td colspan="5" class="mu">No jobs matched. Loosen filters or configure more sources.</td></tr>';
+    $("jobs").innerHTML=JOBS.map((x,i)=>`<tr><td><b>${esc(x.title)}</b><br><span class="mu">${esc(x.company)} | ${esc(x.location)} ${x.posted?"| "+esc(x.posted):""}</span>${x.partial?'<br><span class="tag w">snippet only - verify description</span>':""}${liveTag(x)}${refHtml(x,i)}</td><td><span class="tag">${esc(x.portal)}</span></td><td><span class="sc" style="color:${x.score>=70?"var(--ok)":x.score>=50?"var(--warn)":"var(--mu)"}">${x.score}</span>${x.resume_pct!=null?`<br><span class="mu">resume fit ${x.resume_pct}%</span>`:""}</td><td>${x.matched.map(k=>`<span class="tag ok">${esc(k)}</span>`).join("")}${(x.supported||[]).map(k=>`<span class="tag ok">${esc(k)}</span>`).join("")}${(x.gaps||[]).map(k=>`<span class="tag w" title="Required by the job but not in your resume">gap: ${esc(k)}</span>`).join("")}</td><td>${x.url?`<a href="${esc(x.url)}" target="_blank"><button class="s">Open / Apply</button></a>`:""}<button class="s" onclick="sv(${i},'Saved')">Save</button><button class="s" onclick="sv(${i},'Applied')">Mark applied</button><button class="s" onclick="ref(${i})">Referral drafts</button><button class="s" onclick="dr(${i})">Email draft</button></td></tr>`).join("")||'<tr><td colspan="5" class="mu">No jobs matched. Loosen filters or configure more sources.</td></tr>';
     $("drop").textContent="Filtered out: "+(Object.entries(r.dropped).filter(x=>x[1]).map(x=>x[0].replace(/_/g," ")+" "+x[1]).join(", ")||"nothing");
     $("plinks").innerHTML=r.portal_links.map(p=>`<div style="margin:6px 0"><b>${esc(p.title)}</b> <span class="mu">in ${esc(p.location)}</span> &nbsp; ${Object.entries(p.links).map(([k,u])=>`<a href="${esc(u)}" target="_blank"><span class="tag">${k}</span></a>`).join("")}</div>`).join("")
   }catch(e){$("note").textContent="Error: "+e.message}
   b.disabled=false}
 async function sv(i,s){const r=await api("apps?status="+s,JOBS[i]);toast(`${s}: ${r["Application ID"]}`)}
+function liveTag(x){return x.live==="live"?'<br><span class="tag ok">looks open</span>':(x.live==="unknown"&&!$("d").checked?'<br><span class="tag w" title="Portal blocked the check - open the link to confirm">availability unverified</span>':"")}
+function refHtml(x,i){
+  const r=x.referrals||[];
+  let h=r.length?`<div style="margin-top:6px"><span class="tag ok">${r.length} referral contact${r.length>1?"s":""}</span> ${r.map(m=>`<a href="${esc(m.profile)}" target="_blank" title="${esc(m.position)} @ ${esc(m.company)}"><span class="tag">${esc(m.person)} - ${esc(m.why)}</span></a>`).join("")}</div>`:`<div class="mu" style="margin-top:6px">No matches in loaded connections${CONN?"":" (upload Connections.csv in the Network tab)"}</div>`;
+  h+=`<div style="margin-top:4px">${Object.entries(x.li_links||{}).map(([k,u])=>`<a href="${esc(u)}" target="_blank"><span class="tag">${esc(k)}</span></a>`).join("")}</div><div id="rf${i}"></div>`;
+  return h}
+async function ref(i){
+  const x=JOBS[i],box=$("rf"+i);box.innerHTML='<p class="mu">Drafting referral messages...</p>';
+  try{
+    const a=await api("apps?status=Saved",x);
+    const o=await api("outreach",{job:x,recruiter:"Hiring Team",history:$("hx").value,extra:""});
+    x.app_id=a["Application ID"];RM[i]=o.matches;
+    box.innerHTML=o.matches.length?o.matches.map((m,k)=>`<div class="card" style="margin:8px 0"><b>${esc(m.person)}</b> <span class="tag">${esc(m.why)}</span> <span class="tag">${esc(m.position)} @ ${esc(m.company)}</span>${m.prior?`<span class="tag ok">last chat ${esc(m.prior)}</span>`:""}<textarea id="rm${i}_${k}" rows="7">${esc(m.message)}</textarea><button class="s" onclick="rcp(${i},${k})">Copy + log</button> <a href="${esc(m.profile)}" target="_blank"><button class="s">Open profile</button></a></div>`).join(""):'<p class="mu">No matching connections. Upload Connections.csv in the Network tab, or use the LinkedIn search links above.</p>'
+  }catch(e){box.innerHTML='<p class="mu">'+esc(e.message)+'</p>'}}
+async function rcp(i,k){const m=RM[i][k],t=$("rm"+i+"_"+k).value;try{await navigator.clipboard.writeText(t)}catch(e){}await api("outreach/log",{id:JOBS[i].app_id||"",company:m.company,person:m.person,message:t});toast("Copied and logged in the Outreach tab")}
 function dr(i){cur=JOBS[i];$("dt").textContent=cur.title+" @ "+cur.company;$("dout").innerHTML="";go("draft")}
 async function mk(){
   const b0=$("mkb");b0.disabled=true;
@@ -1025,10 +1093,10 @@ async function cp(k){const m=OM[k],t=$("lm"+k).value;try{await navigator.clipboa
 async function upl(f,ep,o){const x=$(f).files[0];if(!x)return toast("Choose a file first");const r=await api(ep,{csv:await x.text()});$(o).textContent=r.count+" records loaded"}
 async function loadRes(){
   const h=await api("health");$("rinfo").textContent="Detected resume: "+(h.resume||"none - upload one");$("rdl").classList.toggle("hide",!h.resume_built);
-  const p=await api("profile");$("pn").value=p.name;$("pe").value=p.email;$("pp").value=p.phone;$("pl").value=p.linkedin;$("pb").value=p.blog;PR=p.projects||[];rp()}
+  const p=await api("profile");$("pn").value=p.name;$("pe").value=p.email;$("pp").value=p.phone;$("pl").value=p.linkedin;$("pb").value=p.blog;$("pa").value=p.alumni_terms||"";PR=p.projects||[];rp()}
 function rp(){$("prj").innerHTML=PR.map((x,i)=>`<div class="g" style="margin-bottom:8px"><input value="${esc(x.name)}" onchange="PR[${i}].name=this.value" placeholder="Project name"><input value="${esc(x.url)}" onchange="PR[${i}].url=this.value" placeholder="URL"><input value="${esc(x.summary||"")}" onchange="PR[${i}].summary=this.value" placeholder="One line: what it does (optional)"><button class="s" onclick="PR.splice(${i},1);rp()">Remove</button></div>`).join("")}
 function addp(){PR.push({name:"",url:"",summary:""});rp()}
-async function savep(){await api("profile",{name:$("pn").value,email:$("pe").value,phone:$("pp").value,linkedin:$("pl").value,blog:$("pb").value,projects:PR});toast("Profile saved")}
+async function savep(){await api("profile",{name:$("pn").value,email:$("pe").value,phone:$("pp").value,linkedin:$("pl").value,blog:$("pb").value,alumni_terms:$("pa").value,projects:PR});toast("Profile saved")}
 async function rup(){const x=$("rf").files[0];if(!x)return toast("Choose a .docx first");await api("resume/upload",{b64:b64(await x.arrayBuffer())});toast("Resume uploaded");loadRes()}
 async function rbuild(){await savep();try{const r=await api("resume/build",{});$("rout").textContent="Built from "+r.base+"\n- "+r.changes.join("\n- ");$("rdl").classList.remove("hide")}catch(e){$("rout").textContent=e.message}}
 go("dash");
