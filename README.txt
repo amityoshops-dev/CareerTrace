@@ -1,6 +1,5 @@
-CareerTrace Pro - one folder, one command.
-Put this folder inside /workspaces/CareerTrace (drag it into the Codespace explorer), then run:
-
-cd /workspaces/CareerTrace && bash ./CareerTrace-Pro/upgrade_careertrace.sh && ./run.sh
-
-Then open port 8000 and click the blue Pro button (or go to /pro). Safe to re-run; your data and tracker are kept.
+CareerTrace Pro v2 - one folder, one command.
+Codespaces (from the repo root):
+  cd /workspaces/CareerTrace && bash CareerTrace-Pro-v2/install.sh && ./start_pro.sh
+Windows desktop app: copy/clone the whole CareerTrace repo to your PC, run install.sh once in Git Bash (or just keep the files), then double-click start_windows.bat.
+Everything (API keys, sources, search, files) is managed inside the app: Settings tab.
